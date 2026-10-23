@@ -1,1 +1,1 @@
-https://bike-sharing-dashboard-byan.streamlit.app/
+https://bike-sharing-dashboard-byan.streamlit.app
