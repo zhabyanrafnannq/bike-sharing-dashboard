@@ -100,19 +100,22 @@ def create_byusertype_df(df):
 # ================= Menyiapkan DataFrame =================
 @st.cache_data
 def load_data():
-    day_df = pd.read_csv(BASE_DIR / "main_data.csv")
-    hour_df = pd.read_csv(BASE_DIR / "hour_data.csv")
+    # Satu berkas hasil ekspor notebook: all_data.csv (data per jam + weather_day)
+    hour_df = pd.read_csv(BASE_DIR / "all_data.csv")
+    hour_df["dteday"] = pd.to_datetime(hour_df["dteday"])
 
-    season_map = {1: "Spring", 2: "Summer", 3: "Fall", 4: "Winter"}
     weather_map = {1: "Cerah", 2: "Kabut", 3: "Hujan Ringan", 4: "Hujan Lebat"}
-    for df in (day_df, hour_df):
-        df["season_name"] = df["season"].map(season_map)
-        df["weather_name"] = df["weathersit"].map(weather_map)
-        df["dteday"] = pd.to_datetime(df["dteday"])
-        # Fixing invalid value: hum == 0 -> imputasi median per musim
-        med = df.groupby("season")["hum"].median()
-        df["hum"] = df.apply(lambda r: med[r["season"]] if r["hum"] == 0 else r["hum"], axis=1)
 
+    # Turunkan data harian dari data per jam (jumlah penyewaan per hari = jumlah per jam)
+    day_df = hour_df.groupby("dteday").agg(
+        cnt=("cnt", "sum"),
+        casual=("casual", "sum"),
+        registered=("registered", "sum"),
+        season_name=("season_name", "first"),
+        weather_day=("weather_day", "first"),
+        workingday=("workingday", "first")
+    ).reset_index()
+    day_df["weather_name"] = day_df["weather_day"].map(weather_map)
     day_df["month_name"] = day_df["dteday"].dt.strftime('%b')
 
     return day_df, hour_df
