@@ -1,4 +1,1 @@
-Belum di-deploy (menunggu akun GitHub/Streamlit Cloud).
-Cara deploy: push folder ini ke GitHub -> https://share.streamlit.io -> Deploy app -> file path: dashboard/dashboard.py
-Setelah berhasil, ganti isi baris ini dengan tautan dashboard, contoh:
-https://your-app-name.streamlit.app
+https://bike-sharing-dashboard-byan.streamlit.app/
