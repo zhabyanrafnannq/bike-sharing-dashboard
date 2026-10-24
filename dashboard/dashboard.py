@@ -1,18 +1,36 @@
 from pathlib import Path
 
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
+from plotly.subplots import make_subplots
 
 BASE_DIR = Path(__file__).resolve().parent
 
-sns.set(style='dark')
+# Palet: #90CAF9 = penanda (highlight), #D3D3D3 = konteks. Highlight ditentukan dari data,
+# bukan dari urutan bar, agar tidak pernah "nyangkut" di kategori yang salah.
+COLOR_HIGHLIGHT = "#90CAF9"
+COLOR_CONTEXT = "#D3D3D3"
+
+px.defaults.template = "plotly_white"
 
 st.set_page_config(page_title="Bike Sharing Dashboard", page_icon="🚲", layout="wide")
 
 
 # ================= Helper Functions =================
+def highlight_colors(values):
+    """Warnai batang tertinggi dengan warna highlight, sisanya warna konteks."""
+    values = list(values)
+    top = max(values)
+    return [COLOR_HIGHLIGHT if val == top else COLOR_CONTEXT for val in values]
+
+
+def thous(value):
+    """Format angka gaya Indonesia: 64544 -> '64.544'."""
+    return f"{value:,.0f}".replace(",", ".")
+
+
 def create_daily_rentals_df(df):
     """Menyiapkan daily_rentals_df: jumlah penyewaan harian."""
     daily_rentals_df = df.resample(rule='D', on='dteday').agg({
@@ -21,11 +39,11 @@ def create_daily_rentals_df(df):
         "registered": "sum"
     })
     daily_rentals_df = daily_rentals_df.reset_index()
-    daily_rentals_df.rename(columns={
+    daily_rentals_df = daily_rentals_df.rename(columns={
         "cnt": "rental_count",
         "casual": "casual_count",
         "registered": "registered_count"
-    }, inplace=True)
+    })
 
     return daily_rentals_df
 
@@ -44,7 +62,8 @@ def create_monthly_performance_df(df):
 def create_byweather_df(df):
     """Menyiapkan byweather_df: rata-rata penyewaan per kondisi cuaca."""
     byweather_df = df.groupby("weather_name").agg(
-        avg_cnt=("cnt", "mean")
+        avg_cnt=("cnt", "mean"),
+        jumlah_hari=("cnt", "count")
     ).reset_index()
     byweather_df["avg_cnt"] = byweather_df["avg_cnt"].round(0).astype(int)
     byweather_df = byweather_df.sort_values(by="avg_cnt", ascending=False).reset_index(drop=True)
@@ -56,7 +75,8 @@ def create_byseason_df(df):
     """Menyiapkan byseason_df: rata-rata penyewaan per musim."""
     season_order = ["Spring", "Summer", "Fall", "Winter"]
     byseason_df = df.groupby("season_name").agg(
-        avg_cnt=("cnt", "mean")
+        avg_cnt=("cnt", "mean"),
+        jumlah_hari=("cnt", "count")
     ).reset_index()
     byseason_df["avg_cnt"] = byseason_df["avg_cnt"].round(0).astype(int)
     byseason_df['season_name'] = pd.Categorical(byseason_df['season_name'], season_order)
@@ -66,14 +86,19 @@ def create_byseason_df(df):
 
 
 def create_hourly_pattern_df(df):
-    """Menyiapkan hourly_df: rata-rata penyewaan per jam, hari kerja vs akhir pekan."""
-    working = df[df['workingday'] == 1].groupby('hr')['cnt'].mean().round(0).astype(int)
-    weekend = df[df['workingday'] == 0].groupby('hr')['cnt'].mean().round(0).astype(int)
+    """Menyiapkan hourly_df: rata-rata penyewaan per jam, hari kerja vs akhir pekan.
+
+    Jam tanpa data (mis. rentang tanggal yang isinya hanya hari kerja) diisi NaN
+    lewat reindex(range(24)) supaya panjang kedua seri selalu 24 dan tidak
+    memicu error "All arrays must be of the same length".
+    """
+    working = df[df['workingday'] == 1].groupby('hr')['cnt'].mean().reindex(range(24))
+    weekend = df[df['workingday'] == 0].groupby('hr')['cnt'].mean().reindex(range(24))
     hourly_df = pd.DataFrame({
-        "hr": working.index,
-        "workingday": working.values,
-        "weekend": weekend.values
-    }).reset_index(drop=True)
+        "hr": list(range(24)),
+        "workingday": working.to_numpy(),
+        "weekend": weekend.to_numpy()
+    })
 
     return hourly_df
 
@@ -97,6 +122,29 @@ def create_byusertype_df(df):
     return bytype_df
 
 
+def create_demand_cluster_df(df):
+    """Menyiapkan cluster_df: profil hari per kelompok permintaan hasil binning."""
+    cluster_df = df.groupby("demand_level", observed=True).agg(
+        jumlah_hari=("cnt", "count"),
+        rata_rata_cnt=("cnt", "mean"),
+        pct_akhir_pekan=("workingday", lambda x: 100 * (x == 0).mean()),
+        pct_cuaca_buruk=("weathersit", lambda x: 100 * (x >= 2).mean()),
+        total_casual=("casual", "sum"),
+        total_registered=("registered", "sum")
+    )
+    cluster_df["rata_rata_cnt"] = cluster_df["rata_rata_cnt"].round(0)
+    cluster_df["pct_akhir_pekan"] = cluster_df["pct_akhir_pekan"].round(1)
+    cluster_df["pct_cuaca_buruk"] = cluster_df["pct_cuaca_buruk"].round(1)
+    cluster_df["pct_casual"] = (
+        100 * cluster_df["total_casual"]
+        / (cluster_df["total_casual"] + cluster_df["total_registered"])
+    ).round(1)
+    cluster_df = cluster_df.drop(columns=["total_casual", "total_registered"])
+    cluster_df.index = cluster_df.index.astype(str)
+
+    return cluster_df.reset_index()
+
+
 # ================= Menyiapkan DataFrame =================
 @st.cache_data
 def load_data():
@@ -115,23 +163,25 @@ def load_data():
         weather_day=("weather_day", "first"),
         workingday=("workingday", "first")
     ).reset_index()
+    day_df["weathersit"] = day_df["weather_day"]
     day_df["weather_name"] = day_df["weather_day"].map(weather_map)
     day_df["month_name"] = day_df["dteday"].dt.strftime('%b')
+
+    # Clustering binning dihitung pada SELURUH periode (731 hari) lebih dulu, bukan pada
+    # hasil filter, supaya label Low/Medium/High Demand tetap konsisten di rentang apa pun.
+    q1, q3 = day_df["cnt"].quantile([0.33, 0.66])
+    day_df["demand_level"] = pd.cut(
+        day_df["cnt"], bins=[0, q1, q3, day_df["cnt"].max()],
+        labels=["Low Demand", "Medium Demand", "High Demand"], include_lowest=True
+    )
 
     return day_df, hour_df
 
 
 all_df, hour_df = load_data()
 
-datetime_columns = ["dteday"]
-all_df.sort_values(by="dteday", inplace=True)
-all_df.reset_index(inplace=True)
-hour_df.sort_values(by="dteday", inplace=True)
-hour_df.reset_index(inplace=True)
-
-for column in datetime_columns:
-    all_df[column] = pd.to_datetime(all_df[column])
-    hour_df[column] = pd.to_datetime(hour_df[column])
+all_df = all_df.sort_values(by="dteday").reset_index(drop=True)
+hour_df = hour_df.sort_values(by="dteday").reset_index(drop=True)
 
 
 # ================= Membuat Komponen Filter =================
@@ -146,17 +196,43 @@ with st.sidebar:
     st.caption("Fanaee-T & Gama, 2014 | Periode 2011-2012")
 
     # Mengambil start_date & end_date dari date_input
-    start_date, end_date = st.date_input(
+    date_range = st.date_input(
         label='Rentang Waktu', min_value=min_date.date(),
         max_value=max_date.date(),
         value=[min_date.date(), max_date.date()]
     )
 
-main_df = all_df[(all_df["dteday"] >= str(start_date)) &
-                 (all_df["dteday"] <= str(end_date))]
-main_hour_df = hour_df[(hour_df["dteday"] >= str(start_date)) &
-                       (hour_df["dteday"] <= str(end_date))]
+# date_input mengembalikan 2 tanggal, atau 1 tanggal saja ketika pengguna baru memilih
+# satu ujung rentang. Kedua bentuk itu ditangani di sini agar tidak muncul
+# "not enough values to unpack".
+if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+    start_date, end_date = date_range
+elif isinstance(date_range, (list, tuple)) and len(date_range) == 1:
+    start_date = end_date = date_range[0]
+else:
+    start_date, end_date = min_date.date(), max_date.date()
 
+start_ts = pd.Timestamp(start_date)
+end_ts = pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+
+main_df = all_df[(all_df["dteday"] >= start_ts) & (all_df["dteday"] <= end_ts)]
+main_hour_df = hour_df[(hour_df["dteday"] >= start_ts) & (hour_df["dteday"] <= end_ts)]
+
+
+# ================= Header =================
+st.header('Bike Sharing Dashboard :sparkles:')
+
+if main_df.empty:
+    st.warning("Tidak ada data pada rentang waktu yang dipilih. Silakan perlebar rentang tanggalnya.")
+    st.stop()
+
+st.caption(
+    f"Periode terpilih: **{start_ts:%d %b %Y}** s.d. **{end_ts:%d %b %Y}** "
+    f"({main_df.shape[0]} hari, {thous(main_hour_df.shape[0])} baris data per jam)"
+)
+
+# Semua agregasi dipanggil SETELAH pengecekan data kosong, supaya tidak ada
+# helper function yang dijalankan di atas DataFrame kosong.
 daily_rentals_df = create_daily_rentals_df(main_df)
 monthly_df = create_monthly_performance_df(main_df)
 byweather_df = create_byweather_df(main_df)
@@ -165,14 +241,7 @@ hourly_df = create_hourly_pattern_df(main_hour_df)
 peak_working_df = create_peak_hours_df(main_hour_df, workingday=1)
 peak_weekend_df = create_peak_hours_df(main_hour_df, workingday=0)
 bytype_df = create_byusertype_df(main_df)
-
-
-# ================= Header =================
-st.header('Bike Sharing Dashboard :sparkles:')
-
-if main_df.empty:
-    st.warning("Tidak ada data pada rentang waktu yang dipilih.")
-    st.stop()
+cluster_df = create_demand_cluster_df(main_df)
 
 
 # ================= Daily Rentals =================
@@ -182,58 +251,89 @@ col1, col2, col3 = st.columns(3)
 
 with col1:
     total_rentals = daily_rentals_df.rental_count.sum()
-    st.metric("Total Rentals", value=f"{total_rentals:,}".replace(",", "."))
+    st.metric("Total Rentals", value=thous(total_rentals), help="Total penyewaan sepeda pada periode terpilih.")
 
 with col2:
     avg_daily = round(daily_rentals_df.rental_count.mean())
-    st.metric("Average Daily Rentals", value=f"{avg_daily:,}".replace(",", "."))
+    st.metric("Average Daily Rentals", value=thous(avg_daily), help="Satuan: sepeda/hari.")
 
 with col3:
     registered_share = 100 * bytype_df.loc[0, "total"] / bytype_df["total"].sum()
     st.metric("Registered User Share", value=f"{registered_share:.1f}%")
 
-fig, ax = plt.subplots(figsize=(16, 8))
-ax.plot(
-    daily_rentals_df["dteday"],
-    daily_rentals_df["rental_count"],
-    marker='o',
-    markersize=3,
-    linewidth=2,
-    color="#90CAF9"
-)
-ax.tick_params(axis='y', labelsize=20)
-ax.tick_params(axis='x', labelsize=15)
 
-st.pyplot(fig)
+fig = go.Figure()
+fig.add_trace(go.Scatter(
+    x=daily_rentals_df["dteday"], y=daily_rentals_df["rental_count"],
+    mode="lines+markers", name="Total",
+    line=dict(color=COLOR_HIGHLIGHT, width=2), marker=dict(size=5),
+    hovertemplate="%{x|%d %b %Y}<br>Total: %{y:,} sepeda<extra></extra>"
+))
+# Klik legenda untuk menampilkan/menyembunyikan dua seri di bawah ini
+fig.add_trace(go.Scatter(
+    x=daily_rentals_df["dteday"], y=daily_rentals_df["registered_count"],
+    mode="lines", name="Registered", visible="legendonly",
+    line=dict(color="#1f77b4", width=1.5),
+    hovertemplate="%{x|%d %b %Y}<br>Registered: %{y:,} sepeda<extra></extra>"
+))
+fig.add_trace(go.Scatter(
+    x=daily_rentals_df["dteday"], y=daily_rentals_df["casual_count"],
+    mode="lines", name="Casual", visible="legendonly",
+    line=dict(color="#ff7f0e", width=1.5),
+    hovertemplate="%{x|%d %b %Y}<br>Casual: %{y:,} sepeda<extra></extra>"
+))
+
+fig.update_layout(
+    title="Penyewaan Sepeda Harian (2011-2012)",
+    xaxis_title="Tanggal",
+    yaxis_title="Jumlah sepeda disewa (sepeda/hari)",
+    hovermode="x unified",
+    height=460,
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    margin=dict(l=10, r=10, t=90, b=10)
+)
+
+st.plotly_chart(fig)
+st.caption("Tip: tarik (drag) pada grafik untuk zoom ke periode tertentu, atau klik legenda untuk menyembunyikan serinya.")
 
 
 # ================= Best & Worst Performing Month =================
 st.subheader("Best & Worst Performing Month")
 
-fig, ax = plt.subplots(nrows=1, ncols=2, figsize=(35, 15))
-
-colors = ["#90CAF9", "#D3D3D3", "#D3D3D3", "#D3D3D3", "#D3D3D3"]
-
 best_df = monthly_df.head(5)
-sns.barplot(x="avg_cnt", y="month_name", data=best_df, palette=colors, ax=ax[0])
-ax[0].set_ylabel(None)
-ax[0].set_xlabel("Average Rentals per Day", fontsize=30)
-ax[0].set_title("Best Performing Month", loc="center", fontsize=50)
-ax[0].tick_params(axis='y', labelsize=35)
-ax[0].tick_params(axis='x', labelsize=30)
-
 worst_df = monthly_df.sort_values(by="avg_cnt", ascending=True).head(5)
-sns.barplot(x="avg_cnt", y="month_name", data=worst_df, palette=colors, ax=ax[1])
-ax[1].set_ylabel(None)
-ax[1].set_xlabel("Average Rentals per Day", fontsize=30)
-ax[1].invert_xaxis()
-ax[1].yaxis.set_label_position("right")
-ax[1].yaxis.tick_right()
-ax[1].set_title("Worst Performing Month", loc="center", fontsize=50)
-ax[1].tick_params(axis='y', labelsize=35)
-ax[1].tick_params(axis='x', labelsize=30)
 
-st.pyplot(fig)
+fig = make_subplots(
+    rows=1, cols=2, horizontal_spacing=0.12,
+    subplot_titles=("Best Performing Month", "Worst Performing Month")
+)
+
+fig.add_trace(go.Bar(
+    x=best_df["avg_cnt"], y=best_df["month_name"], orientation="h",
+    marker_color=highlight_colors(best_df["avg_cnt"]),
+    text=[thous(v) for v in best_df["avg_cnt"]], textposition="outside",
+    hovertemplate="%{y}<br>Rata-rata: %{x:,} sepeda/hari<extra></extra>",
+    showlegend=False
+), row=1, col=1)
+
+fig.add_trace(go.Bar(
+    x=worst_df["avg_cnt"], y=worst_df["month_name"], orientation="h",
+    marker_color=COLOR_CONTEXT,
+    text=[thous(v) for v in worst_df["avg_cnt"]], textposition="outside",
+    hovertemplate="%{y}<br>Rata-rata: %{x:,} sepeda/hari<extra></extra>",
+    showlegend=False
+), row=1, col=2)
+
+fig.update_xaxes(title_text="Rata-rata sepeda/hari", row=1, col=1)
+fig.update_xaxes(title_text="Rata-rata sepeda/hari", autorange="reversed", row=1, col=2)
+fig.update_yaxes(title_text=None, row=1, col=1)
+fig.update_yaxes(title_text=None, row=1, col=2)
+fig.update_layout(
+    height=460,
+    margin=dict(l=10, r=10, t=70, b=10)
+)
+
+st.plotly_chart(fig)
 
 
 # ================= Rental Characteristics =================
@@ -242,98 +342,230 @@ st.subheader("Rental Characteristics")
 col1, col2 = st.columns(2)
 
 with col1:
-    fig, ax = plt.subplots(figsize=(20, 10))
-
-    sns.barplot(
-        y="avg_cnt",
-        x="weather_name",
-        data=byweather_df,
-        palette=colors,
-        ax=ax
+    fig = go.Figure(go.Bar(
+        x=byweather_df["weather_name"], y=byweather_df["avg_cnt"],
+        marker_color=highlight_colors(byweather_df["avg_cnt"]),
+        text=[thous(v) for v in byweather_df["avg_cnt"]], textposition="outside",
+        customdata=byweather_df[["jumlah_hari"]],
+        hovertemplate=("%{x}<br>Rata-rata: %{y:,} sepeda/hari"
+                       "<br>Jumlah hari: %{customdata[0]} hari<extra></extra>"),
+        showlegend=False
+    ))
+    fig.update_layout(
+        title=dict(text="Average Rentals by Weather", x=0.5, xanchor="center"),
+        xaxis_title="Kondisi cuaca",
+        yaxis_title="Rata-rata sepeda disewa (sepeda/hari)",
+        height=460,
+        margin=dict(l=10, r=10, t=70, b=10)
     )
-    ax.set_title("Average Rentals by Weather", loc="center", fontsize=50)
-    ax.set_ylabel(None)
-    ax.set_xlabel(None)
-    ax.tick_params(axis='x', labelsize=35)
-    ax.tick_params(axis='y', labelsize=30)
-    st.pyplot(fig)
+    st.plotly_chart(fig)
 
 with col2:
-    fig, ax = plt.subplots(figsize=(20, 10))
-
-    colors_season = ["#D3D3D3", "#90CAF9", "#D3D3D3", "#D3D3D3"]
-
-    sns.barplot(
-        y="avg_cnt",
-        x="season_name",
-        data=byseason_df,
-        palette=colors_season,
-        ax=ax
+    fig = go.Figure(go.Bar(
+        x=byseason_df["season_name"], y=byseason_df["avg_cnt"],
+        marker_color=highlight_colors(byseason_df["avg_cnt"]),
+        text=[thous(v) for v in byseason_df["avg_cnt"]], textposition="outside",
+        customdata=byseason_df[["jumlah_hari"]],
+        hovertemplate=("%{x}<br>Rata-rata: %{y:,} sepeda/hari"
+                       "<br>Jumlah hari: %{customdata[0]} hari<extra></extra>"),
+        showlegend=False
+    ))
+    fig.update_layout(
+        title=dict(text="Average Rentals by Season", x=0.5, xanchor="center"),
+        xaxis_title="Musim",
+        yaxis_title="Rata-rata sepeda disewa (sepeda/hari)",
+        height=460,
+        margin=dict(l=10, r=10, t=70, b=10)
     )
-    ax.set_title("Average Rentals by Season", loc="center", fontsize=50)
-    ax.set_ylabel(None)
-    ax.set_xlabel(None)
-    ax.tick_params(axis='x', labelsize=35)
-    ax.tick_params(axis='y', labelsize=30)
-    st.pyplot(fig)
+    st.plotly_chart(fig)
 
-fig, ax = plt.subplots(figsize=(20, 10))
-ax.plot(hourly_df["hr"], hourly_df["workingday"], marker='o', markersize=6,
-        linewidth=3, color="#90CAF9", label="Weekday")
-ax.plot(hourly_df["hr"], hourly_df["weekend"], marker='o', markersize=6,
-        linewidth=3, color="#D3D3D3", label="Weekend")
-ax.set_title("Average Rentals per Hour: Weekday vs Weekend", loc="center", fontsize=30)
-ax.set_ylabel(None)
-ax.set_xlabel("Hour", fontsize=20)
-ax.set_xticks(range(0, 24))
-ax.tick_params(axis='y', labelsize=20)
-ax.tick_params(axis='x', labelsize=15)
-ax.legend(fontsize=20)
-ax.grid(axis='y', linestyle='--', alpha=0.4)
-st.pyplot(fig)
+
+# Tinggi batang tertinggi ditentukan dari data (avg_cnt), jadi highlight selalu jatuh tepat
+peak_weather = byweather_df.loc[byweather_df["avg_cnt"].idxmax(), "weather_name"]
+peak_season = byseason_df.loc[byseason_df["avg_cnt"].idxmax(), "season_name"]
+st.caption(
+    f"Batang berwarna terang menandai nilai tertinggi pada data periode terpilih, "
+    f"yaitu **{peak_weather}** untuk cuaca dan **{peak_season}** untuk musim."
+)
+
+
+# ================= Hourly Pattern =================
+st.subheader("Hourly Pattern: Weekday vs Weekend")
+
+fig = go.Figure()
+fig.add_trace(go.Scatter(
+    x=hourly_df["hr"], y=hourly_df["workingday"],
+    mode="lines+markers", name="Weekday",
+    line=dict(color=COLOR_HIGHLIGHT, width=3), marker=dict(size=7),
+    hovertemplate="Jam %{x}.00<br>Weekday: %{y:.0f} sepeda/jam<extra></extra>"
+))
+fig.add_trace(go.Scatter(
+    x=hourly_df["hr"], y=hourly_df["weekend"],
+    mode="lines+markers", name="Weekend",
+    line=dict(color="#1f77b4", width=3), marker=dict(size=7),
+    hovertemplate="Jam %{x}.00<br>Weekend: %{y:.0f} sepeda/jam<extra></extra>"
+))
+
+fig.update_layout(
+    title="Rata-rata Penyewaan per Jam: Weekday vs Weekend",
+    xaxis_title="Jam dalam sehari",
+    yaxis_title="Rata-rata sepeda disewa (sepeda/jam)",
+    hovermode="x unified",
+    height=460,
+    xaxis=dict(dtick=1, range=[-0.5, 23.5]),
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    margin=dict(l=10, r=10, t=90, b=10)
+)
+
+st.plotly_chart(fig)
+st.caption("Tip: klik legenda **Weekday**/**Weekend** untuk menampilkan atau menyembunyikan salah satu seri.")
 
 
 # ================= Peak Hour & User Type =================
 st.subheader("Peak Hour & User Type")
 
+has_weekday = hourly_df["workingday"].notna().any()
+has_weekend = hourly_df["weekend"].notna().any()
+
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    busiest_hour = int(hourly_df.loc[hourly_df['workingday'].idxmax(), 'hr'])
-    st.metric("Busiest Hour (Weekday)", value=f"{busiest_hour}.00")
+    if has_weekday:
+        busiest_hour = int(hourly_df.loc[hourly_df['workingday'].idxmax(), 'hr'])
+        st.metric("Busiest Hour (Weekday)", value=f"{busiest_hour}.00")
+    else:
+        st.metric("Busiest Hour (Weekday)", value="—", help="Tidak ada data hari kerja pada rentang ini.")
 
 with col2:
-    peak_avg = int(hourly_df['workingday'].max())
-    st.metric("Peak Average (rentals/hour)", value=f"{peak_avg:,}".replace(",", "."))
+    if has_weekday:
+        peak_avg = int(round(hourly_df['workingday'].max()))
+        st.metric("Peak Average (rentals/hour)", value=thous(peak_avg))
+    else:
+        st.metric("Peak Average (rentals/hour)", value="—")
 
 with col3:
-    weekend_peak_hour = int(hourly_df.loc[hourly_df['weekend'].idxmax(), 'hr'])
-    st.metric("Busiest Hour (Weekend)", value=f"{weekend_peak_hour}.00")
+    if has_weekend:
+        weekend_peak_hour = int(hourly_df.loc[hourly_df['weekend'].idxmax(), 'hr'])
+        st.metric("Busiest Hour (Weekend)", value=f"{weekend_peak_hour}.00")
+    else:
+        st.metric("Busiest Hour (Weekend)", value="—", help="Tidak ada data akhir pekan pada rentang ini.")
 
-fig, ax = plt.subplots(nrows=1, ncols=3, figsize=(35, 15))
-colors_peak = ["#90CAF9", "#90CAF9", "#90CAF9", "#90CAF9", "#90CAF9"]
+if not has_weekend:
+    st.info("Rentang tanggal yang dipilih hanya berisi hari kerja, sehingga seri Weekend tidak tersedia.")
 
-sns.barplot(y="cnt", x="hr", data=peak_working_df, palette=colors_peak, ax=ax[0])
-ax[0].set_ylabel(None)
-ax[0].set_xlabel("Hour", fontsize=30)
-ax[0].set_title("Top 5 Rush Hours (Weekday)", loc="center", fontsize=50)
-ax[0].tick_params(axis='y', labelsize=30)
-ax[0].tick_params(axis='x', labelsize=35)
+panels = []
+if not peak_working_df.empty:
+    panels.append(("Top 5 Rush Hours (Weekday)", peak_working_df["hr"], peak_working_df["cnt"],
+                   "Jam", "Rata-rata sepeda/jam"))
+if not peak_weekend_df.empty:
+    panels.append(("Top 5 Hours (Weekend)", peak_weekend_df["hr"], peak_weekend_df["cnt"],
+                   "Jam", "Rata-rata sepeda/jam"))
+panels.append(("Registered vs Casual", bytype_df["user_type"], bytype_df["total"],
+               "Tipe pengguna", "Total sepeda"))
 
-sns.barplot(y="cnt", x="hr", data=peak_weekend_df, palette=colors_peak, ax=ax[1])
-ax[1].set_ylabel(None)
-ax[1].set_xlabel("Hour", fontsize=30)
-ax[1].set_title("Top 5 Hours (Weekend)", loc="center", fontsize=50)
-ax[1].tick_params(axis='y', labelsize=30)
-ax[1].tick_params(axis='x', labelsize=35)
+fig = make_subplots(rows=1, cols=len(panels), horizontal_spacing=0.10,
+                    subplot_titles=[panel[0] for panel in panels])
 
-sns.barplot(y="total", x="user_type", data=bytype_df, palette=colors_peak, ax=ax[2])
-ax[2].set_ylabel(None)
-ax[2].set_xlabel("Total Rentals", fontsize=30)
-ax[2].set_title("Registered vs Casual", loc="center", fontsize=50)
-ax[2].tick_params(axis='y', labelsize=30)
-ax[2].tick_params(axis='x', labelsize=35)
+for i, (title, x_values, y_values, x_title, y_title) in enumerate(panels, start=1):
+    if title == "Registered vs Casual":
+        x_axis = [str(v) for v in x_values]
+        marker_color = highlight_colors(y_values)
+    else:
+        x_axis = [f"{int(v)}.00" for v in x_values]
+        marker_color = COLOR_HIGHLIGHT
+    fig.add_trace(go.Bar(
+        x=x_axis, y=[float(v) for v in y_values],
+        marker_color=marker_color,
+        text=[thous(v) for v in y_values], textposition="outside",
+        hovertemplate=f"{x_title}: %{{x}}<br>{y_title}: %{{y:,.0f}}<extra></extra>",
+        showlegend=False
+    ), row=1, col=i)
+    fig.update_xaxes(title_text=x_title, row=1, col=i)
+    fig.update_yaxes(title_text=y_title, row=1, col=i)
 
-st.pyplot(fig)
+fig.update_layout(height=460, margin=dict(l=10, r=10, t=70, b=10))
+
+st.plotly_chart(fig)
+
+
+# ================= Demand Cluster (Analisis Lanjutan) =================
+st.subheader("Demand Cluster: Low / Medium / High Demand")
+
+st.caption(
+    "Hasil analisis lanjutan (clustering manual / binning) dari notebook. Ambang batas "
+    "kelompok dihitung dari seluruh periode 2011-2012 (kuantil 33% dan 66% dari penyewaan harian), "
+    "lalu hari pada rentang tanggal terpilih dipetakan ke kelompoknya."
+)
+
+col1, col2 = st.columns(2)
+
+with col1:
+    fig = go.Figure(go.Bar(
+        x=cluster_df["demand_level"], y=cluster_df["rata_rata_cnt"],
+        marker_color=highlight_colors(cluster_df["rata_rata_cnt"]),
+        text=[thous(v) for v in cluster_df["rata_rata_cnt"]], textposition="outside",
+        customdata=cluster_df[["jumlah_hari"]],
+        hovertemplate=("%{x}<br>Rata-rata: %{y:,.0f} sepeda/hari"
+                       "<br>Jumlah hari: %{customdata[0]} hari<extra></extra>"),
+        showlegend=False
+    ))
+    fig.update_layout(
+        title=dict(text="Rata-rata Penyewaan per Kelompok Permintaan", x=0.5, xanchor="center"),
+        xaxis_title="Kelompok permintaan",
+        yaxis_title="Rata-rata sepeda disewa (sepeda/hari)",
+        height=430,
+        margin=dict(l=10, r=10, t=70, b=10)
+    )
+    st.plotly_chart(fig)
+
+with col2:
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=cluster_df["demand_level"], y=cluster_df["pct_cuaca_buruk"],
+        name="Hari cuaca kabut/hujan (%)",
+        marker_color=COLOR_HIGHLIGHT,
+        text=[f"{v:.1f}%" for v in cluster_df["pct_cuaca_buruk"]], textposition="outside",
+        hovertemplate="%{x}<br>Cuaca kabut/hujan: %{y:.1f}% hari<extra></extra>"
+    ))
+    fig.add_trace(go.Bar(
+        x=cluster_df["demand_level"], y=cluster_df["pct_casual"],
+        name="Porsi pengguna casual (%)",
+        marker_color=COLOR_CONTEXT,
+        text=[f"{v:.1f}%" for v in cluster_df["pct_casual"]], textposition="outside",
+        hovertemplate="%{x}<br>Porsi casual: %{y:.1f}%<extra></extra>"
+    ))
+    fig.update_layout(
+        title=dict(text="Komposisi Cuaca Buruk & Pengguna Casual", x=0.5, xanchor="center"),
+        xaxis_title="Kelompok permintaan",
+        yaxis_title="Persentase (%)",
+        barmode="group",
+        height=430,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=10, r=10, t=90, b=10)
+    )
+    st.plotly_chart(fig)
+
+st.dataframe(
+    cluster_df.rename(columns={
+        "demand_level": "Kelompok",
+        "jumlah_hari": "Jumlah hari",
+        "rata_rata_cnt": "Rata-rata sepeda/hari",
+        "pct_akhir_pekan": "Hari akhir pekan (%)",
+        "pct_cuaca_buruk": "Hari cuaca kabut/hujan (%)",
+        "pct_casual": "Porsi pengguna casual (%)"
+    }),
+    hide_index=True,
+    column_config={
+        "Rata-rata sepeda/hari": st.column_config.NumberColumn(format="%.0f"),
+        "Hari akhir pekan (%)": st.column_config.NumberColumn(format="%.1f%%"),
+        "Hari cuaca kabut/hujan (%)": st.column_config.NumberColumn(format="%.1f%%"),
+        "Porsi pengguna casual (%)": st.column_config.NumberColumn(format="%.1f%%")
+    }
+)
+
+st.caption(
+    "Semakin tinggi kelompok permintaan, semakin kecil porsi hari dengan cuaca kabut/hujan — "
+    "konsisten dengan temuan bahwa cuaca adalah penekan permintaan terkuat."
+)
 
 st.caption('Copyright (c) Zhabyan Rafnan Nur Qohharsya 2026')
